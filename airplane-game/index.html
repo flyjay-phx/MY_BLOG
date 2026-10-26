@@ -1,0 +1,303 @@
+PASTE_TEST<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>스카이 파일럿 ✈️ 비행기 슈팅 게임</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; background: #0b1020; color: #fff; font-family: system-ui, -apple-system, "Malgun Gothic", sans-serif; overflow: hidden; touch-action: none; }
+  #wrap { position: relative; width: 100%; height: 100%; display: flex; align-items: center; justify-content: center; }
+  canvas { display: block; background: linear-gradient(#1b2a5a, #3b5ba5 60%, #7fb2e5); border-radius: 12px; box-shadow: 0 10px 40px rgba(0,0,0,.5); max-width: 100%; max-height: 100%; }
+  #hud { position: absolute; top: 12px; left: 50%; transform: translateX(-50%); display: flex; gap: 18px; font-weight: 700; font-size: 16px; text-shadow: 0 2px 4px rgba(0,0,0,.6); pointer-events: none; }
+  #overlay { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 14px; background: rgba(5,10,25,.72); text-align: center; padding: 16px; }
+  #overlay h1 { font-size: 36px; }
+  #overlay p { opacity: .9; line-height: 1.6; }
+  button { font: inherit; font-weight: 700; font-size: 18px; padding: 12px 28px; border: 0; border-radius: 999px; background: #ffb703; color: #1b1b1b; cursor: pointer; }
+  button:hover { filter: brightness(1.1); }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="game" width="480" height="720"></canvas>
+  <div id="hud"><span id="score">점수 0</span><span id="lives">❤️❤️❤️</span><span id="best">최고 0</span></div>
+  <div id="overlay">
+    <h1>✈️ 스카이 파일럿</h1>
+    <p>적 비행기를 피하고 격추하세요!<br>
+      PC: ← → ↑ ↓ 이동 · 스페이스 발사 · P 일시정지<br>
+      모바일: 화면을 드래그하면 이동 (자동 발사)</p>
+    <button id="startBtn">게임 시작</button>
+  </div>
+</div>
+<script>
+const cv = document.getElementById('game');
+const ctx = cv.getContext('2d');
+const W = cv.width, H = cv.height;
+const $ = id => document.getElementById(id);
+
+let best = 0;
+try { best = +localStorage.getItem('skyPilotBest') || 0; } catch (e) {}
+$('best').textContent = '최고 ' + best;
+
+const keys = {};
+let state, running = false, paused = false, lastTime = 0;
+
+function reset() {
+  state = {
+    player: { x: W / 2, y: H - 100, w: 44, h: 48, speed: 320, cooldown: 0, invincible: 0 },
+    bullets: [], enemies: [], enemyBullets: [], particles: [], items: [],
+    clouds: Array.from({ length: 6 }, () => ({ x: Math.random() * W, y: Math.random() * H, s: 30 + Math.random() * 50, v: 30 + Math.random() * 40 })),
+    score: 0, lives: 3, spawn: 0, time: 0, power: 1, powerTime: 0,
+    touch: null
+  };
+  updateHud();
+}
+
+function updateHud() {
+  $('score').textContent = '점수 ' + state.score;
+  $('lives').textContent = '❤️'.repeat(Math.max(state.lives, 0)) || '💀';
+  $('best').textContent = '최고 ' + best;
+}
+
+// ---------- 그리기 ----------
+function drawPlane(x, y, w, h, body, wing, flip) {
+  ctx.save();
+  ctx.translate(x, y);
+  if (flip) ctx.rotate(Math.PI);
+  ctx.fillStyle = wing;               // 날개
+  ctx.beginPath();
+  ctx.moveTo(-w / 2, h * 0.1); ctx.lineTo(w / 2, h * 0.1); ctx.lineTo(w * 0.15, -h * 0.1); ctx.lineTo(-w * 0.15, -h * 0.1);
+  ctx.closePath(); ctx.fill();
+  ctx.fillRect(-w * 0.25, h * 0.32, w * 0.5, h * 0.1); // 꼬리날개
+  ctx.fillStyle = body;               // 동체
+  ctx.beginPath(); ctx.ellipse(0, 0, w * 0.13, h / 2, 0, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = '#9ad7ff';          // 조종석
+  ctx.beginPath(); ctx.ellipse(0, -h * 0.18, w * 0.07, h * 0.1, 0, 0, Math.PI * 2); ctx.fill();
+  ctx.restore();
+}
+
+function draw() {
+  ctx.clearRect(0, 0, W, H);
+  // 구름
+  ctx.fillStyle = 'rgba(255,255,255,.18)';
+  for (const c of state.clouds) {
+    ctx.beginPath();
+    ctx.arc(c.x, c.y, c.s * .5, 0, Math.PI * 2);
+    ctx.arc(c.x + c.s * .4, c.y + 6, c.s * .4, 0, Math.PI * 2);
+    ctx.arc(c.x - c.s * .4, c.y + 8, c.s * .35, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  // 아이템
+  for (const it of state.items) {
+    ctx.fillStyle = it.type === 'power' ? '#ffd166' : '#ef476f';
+    ctx.beginPath(); ctx.arc(it.x, it.y, 12, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = '#111'; ctx.font = 'bold 14px sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText(it.type === 'power' ? 'P' : '+', it.x, it.y + 1);
+  }
+  // 플레이어 총알
+  ctx.fillStyle = '#fff3b0';
+  for (const b of state.bullets) ctx.fillRect(b.x - 2, b.y - 8, 4, 14);
+  // 적 총알
+  ctx.fillStyle = '#ff6b6b';
+  for (const b of state.enemyBullets) { ctx.beginPath(); ctx.arc(b.x, b.y, 5, 0, Math.PI * 2); ctx.fill(); }
+  // 적
+  for (const e of state.enemies) {
+    drawPlane(e.x, e.y, e.w, e.h, e.big ? '#6a040f' : '#9d0208', e.big ? '#370617' : '#dc2f02', true);
+    if (e.big) { ctx.fillStyle = '#fff'; ctx.fillRect(e.x - 20, e.y - e.h / 2 - 10, 40 * (e.hp / e.maxHp), 4); }
+  }
+  // 플레이어 (무적 시간에는 깜빡임)
+  const p = state.player;
+  if (!(p.invincible > 0 && Math.floor(p.invincible * 10) % 2 === 0)) drawPlane(p.x, p.y, p.w, p.h, '#e9ecef', '#219ebc', false);
+  // 파티클
+  for (const pt of state.particles) {
+    ctx.globalAlpha = Math.max(pt.life / pt.max, 0);
+    ctx.fillStyle = pt.c; ctx.beginPath(); ctx.arc(pt.x, pt.y, pt.r, 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+  if (state.power > 1) {
+    ctx.fillStyle = '#ffd166'; ctx.font = 'bold 14px sans-serif'; ctx.textAlign = 'left';
+    ctx.fillText('파워업 ' + Math.ceil(state.powerTime) + '초', 12, H - 14);
+  }
+  if (paused) {
+    ctx.fillStyle = 'rgba(0,0,0,.5)'; ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = '#fff'; ctx.font = 'bold 32px sans-serif'; ctx.textAlign = 'center';
+    ctx.fillText('일시정지 (P)', W / 2, H / 2);
+  }
+}
+
+// ---------- 로직 ----------
+function explode(x, y, color, n = 18) {
+  for (let i = 0; i < n; i++) {
+    const a = Math.random() * Math.PI * 2, s = 60 + Math.random() * 180;
+    state.particles.push({ x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s, r: 2 + Math.random() * 3, life: .6, max: .6, c: color });
+  }
+}
+
+function hit(a, b) {
+  return Math.abs(a.x - b.x) < (a.w + b.w) / 2 * 0.7 && Math.abs(a.y - b.y) < (a.h + b.h) / 2 * 0.7;
+}
+
+function spawnEnemy() {
+  const level = 1 + state.time / 20;
+  const big = Math.random() < Math.min(0.08 + state.time / 400, 0.25);
+  const w = big ? 70 : 38, h = big ? 70 : 40;
+  state.enemies.push({
+    x: w / 2 + Math.random() * (W - w), y: -h, w, h, big,
+    vy: (big ? 60 : 110 + Math.random() * 60) * Math.min(level, 2.5),
+    vx: big ? 0 : (Math.random() - .5) * 80,
+    hp: big ? 8 : 1, maxHp: big ? 8 : 1,
+    fire: 1 + Math.random() * 2
+  });
+}
+
+function playerHit() {
+  const p = state.player;
+  if (p.invincible > 0) return;
+  state.lives--; p.invincible = 2; state.power = 1;
+  explode(p.x, p.y, '#8ecae6', 30);
+  updateHud();
+  if (state.lives <= 0) gameOver();
+}
+
+function update(dt) {
+  const s = state, p = s.player;
+  s.time += dt;
+  // 이동 (키보드)
+  let dx = (keys.ArrowRight || keys.d ? 1 : 0) - (keys.ArrowLeft || keys.a ? 1 : 0);
+  let dy = (keys.ArrowDown || keys.s ? 1 : 0) - (keys.ArrowUp || keys.w ? 1 : 0);
+  p.x += dx * p.speed * dt; p.y += dy * p.speed * dt;
+  // 이동 (터치)
+  if (s.touch) { p.x += (s.touch.x - p.x) * Math.min(dt * 12, 1); p.y += (s.touch.y - 60 - p.y) * Math.min(dt * 12, 1); }
+  p.x = Math.max(p.w / 2, Math.min(W - p.w / 2, p.x));
+  p.y = Math.max(p.h / 2, Math.min(H - p.h / 2, p.y));
+  p.invincible = Math.max(0, p.invincible - dt);
+  // 발사
+  p.cooldown -= dt;
+  if ((keys[' '] || s.touch) && p.cooldown <= 0) {
+    p.cooldown = 0.16;
+    const spread = s.power >= 2 ? [-14, 0, 14] : [0];
+    for (const o of spread) s.bullets.push({ x: p.x + o, y: p.y - p.h / 2, vx: o * 4, w: 4, h: 14 });
+  }
+  if (s.power > 1) { s.powerTime -= dt; if (s.powerTime <= 0) s.power = 1; }
+  // 적 생성
+  s.spawn -= dt;
+  if (s.spawn <= 0) { spawnEnemy(); s.spawn = Math.max(0.25, 1.1 - s.time / 60); }
+  // 구름
+  for (const c of s.clouds) { c.y += c.v * dt; if (c.y - c.s > H) { c.y = -c.s; c.x = Math.random() * W; } }
+  // 총알
+  for (const b of s.bullets) { b.y -= 620 * dt; b.x += b.vx * dt; }
+  s.bullets = s.bullets.filter(b => b.y > -20);
+  for (const b of s.enemyBullets) { b.x += b.vx * dt; b.y += b.vy * dt; }
+  s.enemyBullets = s.enemyBullets.filter(b => b.y < H + 20 && b.x > -20 && b.x < W + 20);
+  // 적
+  for (const e of s.enemies) {
+    e.y += e.vy * dt; e.x += e.vx * dt;
+    if (e.x < e.w / 2 || e.x > W - e.w / 2) e.vx *= -1;
+    e.fire -= dt;
+    if (e.fire <= 0 && e.y > 0 && e.y < H * 0.7) {
+      e.fire = e.big ? 0.9 : 2 + Math.random() * 2;
+      const a = Math.atan2(p.y - e.y, p.x - e.x), sp = 220;
+      s.enemyBullets.push({ x: e.x, y: e.y + e.h / 2, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, w: 8, h: 8 });
+    }
+  }
+  // 충돌: 내 총알 ↔ 적
+  for (const b of s.bullets) for (const e of s.enemies) {
+    if (!b.dead && !e.dead && hit(b, e)) {
+      b.dead = true; e.hp--;
+      explode(b.x, b.y, '#ffd166', 4);
+      if (e.hp <= 0) {
+        e.dead = true; s.score += e.big ? 50 : 10;
+        explode(e.x, e.y, '#f77f00', e.big ? 40 : 18);
+        const r = Math.random();
+        if (r < (e.big ? 0.6 : 0.06)) s.items.push({ x: e.x, y: e.y, type: 'power', w: 24, h: 24 });
+        else if (r > 0.97) s.items.push({ x: e.x, y: e.y, type: 'life', w: 24, h: 24 });
+        updateHud();
+      }
+    }
+  }
+  s.bullets = s.bullets.filter(b => !b.dead);
+  // 충돌: 적·적 총알 ↔ 나
+  for (const e of s.enemies) if (!e.dead && hit(e, p)) { e.dead = true; explode(e.x, e.y, '#f77f00'); playerHit(); }
+  for (const b of s.enemyBullets) if (!b.dead && hit(b, p)) { b.dead = true; playerHit(); }
+  s.enemyBullets = s.enemyBullets.filter(b => !b.dead);
+  s.enemies = s.enemies.filter(e => !e.dead && e.y < H + e.h);
+  // 아이템
+  for (const it of s.items) {
+    it.y += 120 * dt;
+    if (hit(it, p)) {
+      it.dead = true;
+      if (it.type === 'power') { s.power = 2; s.powerTime = 10; }
+      else { s.lives = Math.min(s.lives + 1, 5); updateHud(); }
+    }
+  }
+  s.items = s.items.filter(it => !it.dead && it.y < H + 20);
+  // 파티클
+  for (const pt of s.particles) { pt.x += pt.vx * dt; pt.y += pt.vy * dt; pt.life -= dt; }
+  s.particles = s.particles.filter(pt => pt.life > 0);
+}
+
+function loop(t) {
+  if (!running) return;
+  const dt = Math.min((t - lastTime) / 1000, 0.05);
+  lastTime = t;
+  if (!paused) update(dt);
+  draw();
+  requestAnimationFrame(loop);
+}
+
+function start() {
+  reset();
+  $('overlay').classList.add('hidden');
+  running = true; paused = false;
+  lastTime = performance.now();
+  requestAnimationFrame(loop);
+}
+
+function gameOver() {
+  running = false;
+  if (state.score > best) {
+    best = state.score;
+    try { localStorage.setItem('skyPilotBest', best); } catch (e) {}
+  }
+  updateHud();
+  draw();
+  const ov = $('overlay');
+  ov.querySelector('h1').textContent = '💥 게임 오버';
+  ov.querySelector('p').innerHTML = '점수: <b>' + state.score + '</b><br>최고 기록: <b>' + best + '</b>';
+  $('startBtn').textContent = '다시 하기';
+  ov.classList.remove('hidden');
+}
+
+// ---------- 입력 ----------
+addEventListener('keydown', e => {
+  keys[e.key.length === 1 ? e.key.toLowerCase() : e.key] = true;
+  if ([' ', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.key)) e.preventDefault();
+  if ((e.key === 'p' || e.key === 'P') && running) paused = !paused;
+  if (e.key === 'Enter' && !running) start();
+});
+addEventListener('keyup', e => { keys[e.key.length === 1 ? e.key.toLowerCase() : e.key] = false; });
+
+function toCanvas(ev) {
+  const r = cv.getBoundingClientRect();
+  return { x: (ev.clientX - r.left) * W / r.width, y: (ev.clientY - r.top) * H / r.height };
+}
+cv.addEventListener('pointerdown', e => { if (running) state.touch = toCanvas(e); });
+cv.addEventListener('pointermove', e => { if (running && state.touch) state.touch = toCanvas(e); });
+addEventListener('pointerup', () => { if (state) state.touch = null; });
+
+$('startBtn').addEventListener('click', start);
+
+// 화면 크기에 맞춰 캔버스 비율 유지
+function fit() {
+  const scale = Math.min(innerWidth / W, innerHeight / H, 1.4);
+  cv.style.width = W * scale + 'px';
+  cv.style.height = H * scale + 'px';
+}
+addEventListener('resize', fit);
+fit();
+reset();
+draw();
+</script>
+</body>
+</html>
